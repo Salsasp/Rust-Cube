@@ -1,203 +1,120 @@
-use crossterm::{cursor, execute, terminal, style::Print};
-use std::{f32::consts::PI, io::{stdout, Write}};
-const SCREEN_WIDTH: u32 = 50;
-const SCREEN_HEIGHT: u32 = 50;
+use std::{thread, time::Duration};
+const SCREEN_WIDTH: usize = 90;
+const SCREEN_HEIGHT: usize = 60;
+const CAM_DISTANCE:f32 = 50.0;
+const K1:f32 = 20.0; // Depth scaling constant
+const CUBE_WIDTH: u32 = 15;
+const OFFSET_X:i32 = CUBE_WIDTH as i32;
+const OFFSET_Y:i32 = CUBE_WIDTH as i32;
+const ROTATION_SPEED: f32 = 0.2;
 
-#[derive(Clone)]
-struct Vertex {
-    x: f32,
-    y: f32,
-    z: f32,
-    one: f32
+#[derive (Clone, Copy, Debug)]
+struct CubeInfo {
+    A:f32,
+    B:f32,
+    C:f32,
+    x:f32,
+    y:f32,
+    z:f32,
+    z_recip:f32, // 1 over z
+    xp:u32, // x pixel coord
+    yp:u32, // y pixel coord
+    idx:usize // Index used to access relevant buffer areas.
+}             // This probably shouldn't be a field, but I'm too lazy to refactor the code :)
+
+struct Screen {
+    zbuffer:[f32; SCREEN_WIDTH*SCREEN_HEIGHT],
+    pixbuffer:[char; SCREEN_WIDTH*SCREEN_HEIGHT],
 }
 
-fn clear_screen() {
-    execute!(stdout(), terminal::Clear(terminal::ClearType::All)).unwrap();
+// All rotation calculations are flattened to the specific equation for an xyz rotation
+// rather than using the actual matrices, thus skipping the annoying vector math!
+
+fn calculate_x(cube:&CubeInfo, i:f32, j:f32, k:f32) -> f32 {
+    return j * cube.A.sin() * cube.B.sin() * cube.C.cos() - k * cube.A.cos() * cube.B.sin() * cube.C.sin()
+    + j * cube.A.cos() * cube.C.sin() + k * cube.A.sin() * cube.C.sin() + i * cube.B.cos() * cube.C.cos();
 }
 
-fn move_cursor(x: u16, y: u16) {
-    execute!(stdout(), cursor::MoveTo(x, y)).unwrap();
+fn calculate_y(cube:&CubeInfo, i:f32, j:f32, k:f32) -> f32 {
+    return j* cube.A.cos() * cube.C.cos() + k * cube.A.sin() * cube.C.cos() -
+    j * cube.A.sin() * cube.B.sin() * cube.C.sin() + k * cube.A.cos() * cube.B.sin() * cube.C.sin() -
+    i * cube.B.cos() * cube.C.sin();
 }
 
-fn draw_point(x: i32, y: i32, ch: char) {
-    if x >= 0 && y >= 0 {
-        move_cursor(x as u16, y as u16);
-        print!("{}", ch);
-    }
+fn calculate_z(cube:&CubeInfo, i:f32, j:f32, k:f32) -> f32 {
+    return k * cube.A.cos() * cube.B.cos() - j * cube.A.sin() * cube.B.cos() + i * cube.B.sin();
 }
 
-fn perspective_matrix(fovY:f32, aspect:f32, near:f32, far:f32) -> [[f32;4];4] {
-    let matrix = [
-        [1.0/(aspect*(fovY/2.0).tan()), 0.0, 0.0, 0.0],
-        [0.0, 1.0/(fovY/2.0).tan(), 0.0, 0.0],
-        [0.0, 0.0, -((far + near)/(far - near)), -((2.0*far*near)/(far - near))],
-        [0.0, 0.0, -1.0, 0.0]
-    ];
-    return matrix;
-}
+fn calculate_surface(screen:&mut Screen,cube:&mut CubeInfo, cube_x:f32, cube_y:f32, cube_z:f32, c:char) {
+    cube.x = calculate_x(cube, cube_x, cube_y, cube_z);
+    cube.y = calculate_y(cube, cube_x, cube_y, cube_z);
+    cube.z = calculate_z(cube, cube_x, cube_y, cube_z) + CAM_DISTANCE; 
 
-fn x_rotation_matrix(theta:f32) -> [[f32;4];4] {
-    let matrix = [
-        [1.0,0.0,0.0,0.0],
-        [0.0,theta.cos(),-theta.sin(),0.0],
-        [0.0,theta.sin(),theta.cos(),0.0],
-        [0.0,0.0,0.0,1.0]
-    ];
-    return matrix;
-}
+    cube.z_recip = 1.0/cube.z;
 
-fn y_rotation_matrix(theta:f32) -> [[f32;4];4] {
-    let matrix = [
-        [theta.cos(),0.0,theta.sin(),0.0],
-        [0.0,1.0,0.0,0.0],
-        [-theta.sin(),0.0,theta.cos(),0.0],
-        [0.0,0.0,0.0,1.0]
-    ];
-    return matrix;
-}
+    // Buffer coordinates
+    cube.xp = (SCREEN_WIDTH as f32 / 2.0 + (OFFSET_X as f32) + K1 * cube.z_recip * cube.x) as u32;
+    cube.yp = (SCREEN_HEIGHT as f32 / 2.0 + (OFFSET_Y as f32) + K1 * cube.z_recip * cube.y) as u32;
 
-fn z_rotation_matrix(theta:f32) -> [[f32;4];4] {
-    let matrix = [
-        [theta.cos(),-theta.sin(),0.0,0.0],
-        [theta.sin(),theta.cos(),0.0,0.0],
-        [0.0,0.0,1.0,0.0],
-        [0.0,0.0,0.0,1.0]    
-    ];
-    return matrix;
-}
-
-fn zero_matrix_4x4() -> [[f32;4];4] {
-    let matrix = [
-        [0.0,0.0,0.0,0.0],
-        [0.0,0.0,0.0,0.0],
-        [0.0,0.0,0.0,0.0],
-        [0.0,0.0,0.0,0.0]
-    ];
-    return matrix;
-}
-
-fn zero_matrix_3x3() -> [[f32;3];3] {
-    let matrix = [
-        [0.0,0.0,0.0],
-        [0.0,0.0,0.0],
-        [0.0,0.0,0.0]
-    ];
-    return matrix;
-}
-
-fn matrix_mult_4x4(matrix1:[[f32;4];4], matrix2:[[f32;4];4]) -> [[f32;4];4] {
-    let mut res: [[f32;4];4] = zero_matrix_4x4();
-    for k in 0..4 {
-        for i in 0..4 {
-            for j in 0..4 {
-                res[k][i] +=
-                matrix1[k][j] * matrix2[j][i]
-            }
+    cube.idx = (cube.xp + (cube.yp * SCREEN_WIDTH as u32)) as usize; // Index for the pixel-buffer
+    if cube.idx >= 0 as usize && (cube.idx as u32) < (SCREEN_WIDTH as u32 * SCREEN_HEIGHT as u32) {
+        if cube.z_recip > screen.zbuffer[cube.idx] as f32 {
+            screen.zbuffer[cube.idx] = cube.z_recip;
+            screen.pixbuffer[cube.idx] = c;
         }
-    }
-    return res;
-}
-
-fn matrix_mult_3x3(matrix1:[[f32;3];3], matrix2:[[f32;3];3]) -> [[f32;3];3] {
-    let mut res: [[f32;3];3] = zero_matrix_3x3();
-    for k in 0..3 {
-        for i in 0..3 {
-            for j in 0..3 {
-                res[k][i] +=
-                matrix1[k][j] * matrix2[j][i]
-            }
-        }
-    }
-    return res;
-}
-
-fn matrix_mult_vertices_4x4(vec3: &mut Vec<Vertex>, matrix: [[f32; 4]; 4]) {
-    for i in 0..vec3.len() {
-        let x = vec3[i].x;
-        let y = vec3[i].y;
-        let z = vec3[i].z;
-        let w = vec3[i].one;
-
-        let new_x = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3] * w;
-        let new_y = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3] * w;
-        let new_z = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3] * w;
-        let new_w = matrix[3][0] * x + matrix[3][1] * y + matrix[3][2] * z + matrix[3][3] * w;
-
-        vec3[i].x = new_x / new_w;
-        vec3[i].y = new_y / new_w;
-        vec3[i].z = new_z / new_w;
-        //draw_point((new_x/new_w) as i32, (new_y/new_w) as i32, '#');
-    }
-}
-
-fn lerp_vectors(vecs: &mut Vec<Vertex>,lx:i32, rx:i32, ly:i32, ry:i32) {
-    for i in 0..vecs.len() {
-        let mapped_x = lx as f32 + vecs[i].x * ((rx - lx) as f32);
-        let mapped_y = ly as f32 + vecs[i].y * ((ry - ly) as f32);
-        vecs[i].x = mapped_x;
-        vecs[i].y = mapped_y;
-    }
-}
-
-fn print_matrix(matrix: [[f32;4];4]) {
-    for i in 0..4 {
-        for j in 0..4 {
-            print!("{} ",matrix[i][j]);
-        }
-        print!("\n");
     }
 }
 
 fn main() {
-    let aspect = SCREEN_WIDTH as f32 / SCREEN_HEIGHT as f32;
-    let fov:f32 = 60.0;
-    let near:f32 = 0.1;
-    let far:f32 = 50.0;
-    let mut vertices: Vec<Vertex> = vec!(
-        Vertex {x:-1.0, y:-1.0, z:1.0, one:1.0}, // front-bottom-left
-        Vertex {x:1.0, y:-1.0, z:1.0, one:1.0},
-        Vertex {x:1.0, y:1.0, z:1.0, one:1.0},
-        Vertex {x:-1.0, y:1.0, z:1.0, one:1.0},
-        Vertex {x:-1.0, y:-1.0, z:-1.0, one:1.0},
-        Vertex {x:-1.0, y:1.0, z:-1.0, one:1.0},
-        Vertex {x:1.0, y:-1.0, z:-1.0, one:1.0},
-        Vertex {x:1.0, y:1.0, z:-1.0, one:1.0}
-    );
-    //print!("Testing matrix mult: \n");
-    let mut theta = 0.0;
-    let rotation_rate = 0.05;
-    let original_vertices = vertices.clone();
-    while true {
-        std::thread::sleep(std::time::Duration::from_millis(50)); // ~60fps
-        clear_screen();
-        let mut transformed_vertices = original_vertices.clone();
-        if theta > 2.0*PI {theta = 0.0;}
-        // Transformation matrix representing 90deg
-        // rotation across all axises at once
-        let mut transformation = 
-        matrix_mult_4x4(
-            x_rotation_matrix(theta),
-                    y_rotation_matrix(theta)
-        );
-        transformation = matrix_mult_4x4(transformation, z_rotation_matrix(theta));
-        transformation = matrix_mult_4x4(transformation, perspective_matrix(fov, aspect, near, far));
-        matrix_mult_vertices_4x4(&mut transformed_vertices, transformation);
-        lerp_vectors(&mut transformed_vertices, 0, SCREEN_WIDTH as i32, 0, SCREEN_HEIGHT as i32);
-        let min_x = transformed_vertices.iter()
-            .map(|v| v.x)
-            .fold(f32::INFINITY, |min_val, x| min_val.min(x)).abs();
-        let min_y = transformed_vertices.iter()
-            .map(|v| v.y)
-            .fold(f32::INFINITY, |min_val, y| min_val.min(y)).abs();
-        for i in 0..transformed_vertices.len() {
-            draw_point((transformed_vertices[i].x + min_x) as i32, (transformed_vertices[i].y + min_y) as i32, '#');
-            //println!("Theta: {}",theta);
-            //println!("{} {} \n", (transformed_vertices[i].x + min_x) as i32,(transformed_vertices[i].y + min_y) as i32);
+    print!("\x1b[2J"); // ANSI escape code that clears an ANSI compatible terminal
+    let mut A = 0.0;
+    let mut B = 0.0;
+    let mut C = 0.0;
+    loop {
+        // Reset the screen buffers every loop
+        let tmp1:[char; SCREEN_WIDTH * SCREEN_HEIGHT] = [' '; SCREEN_WIDTH * SCREEN_HEIGHT];
+        let tmp2:[f32; SCREEN_WIDTH * SCREEN_HEIGHT] = [0.0; SCREEN_WIDTH * SCREEN_HEIGHT];
+        let mut screen:Screen = Screen {
+            zbuffer: tmp2,
+            pixbuffer: tmp1,
+        };
+        // Reset the cube info every loop
+        let mut cube:CubeInfo = CubeInfo {
+            A: A.clone(),
+            B: B.clone(),
+            C: C.clone(),
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            z_recip: 0.0,
+            xp: 0,
+            yp: 0,
+            idx: 0,
+        };
+        // Rust doesn't support C style for loops so I'm stuck with this abomination :(
+        let mut cube_x = -(CUBE_WIDTH as f32); let mut cube_y = -(CUBE_WIDTH as f32);
+        while cube_x < CUBE_WIDTH as f32 {
+            while cube_y < CUBE_WIDTH as f32 {
+                calculate_surface(&mut screen, &mut cube, cube_x, cube_y, -(CUBE_WIDTH as f32), '*');
+                calculate_surface(&mut screen, &mut cube, CUBE_WIDTH as f32, cube_y, cube_x, '&');
+                calculate_surface(&mut screen, &mut cube, -(CUBE_WIDTH as f32), cube_y, -cube_x, '$');
+                calculate_surface(&mut screen, &mut cube, -cube_x, cube_y, CUBE_WIDTH as f32, '#');
+                calculate_surface(&mut screen, &mut cube, cube_x, -(CUBE_WIDTH as f32), -cube_y, '@');
+                calculate_surface(&mut screen, &mut cube, cube_x, CUBE_WIDTH as f32, cube_y, '+');
+                cube_y += ROTATION_SPEED;
+            }
+            cube_y = -(CUBE_WIDTH as f32);
+            cube_x += ROTATION_SPEED;
         }
-        for vec in transformed_vertices.iter() {
-            //println!("{} {} {} {} \n", vec.x,vec.y,vec.z,vec.one);
+        print!("\x1b[H"); // x1b is the 'esc' key, and [H is an ANSI command that returns cursor to home
+        for k in 0..SCREEN_WIDTH*SCREEN_HEIGHT {
+            let tmp:char;
+            if (k % SCREEN_WIDTH) != 0 {tmp = screen.pixbuffer[k]} else {tmp = '\n'};
+            print!("{}",tmp);
         }
-        //print_matrix(transformation);
-        theta+=rotation_rate;
+        A += 0.05;
+        B += 0.05;
+        C += 0.01;
+        thread::sleep(Duration::new(0,500));
     }
 }
